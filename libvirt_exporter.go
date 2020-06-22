@@ -16,15 +16,21 @@
 package main
 
 import (
+	"encoding/json"
 	"encoding/xml"
+	"fmt"
+	"io/ioutil"
+	"log"
+	"net/http"
+	"os"
+	"strconv"
+	"strings"
+
 	"github.com/libvirt/libvirt-go"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/rumanzo/libvirt_exporter_improved/libvirt_schema"
 	"gopkg.in/alecthomas/kingpin.v2"
-	"log"
-	"net/http"
-	"os"
 )
 
 var (
@@ -211,7 +217,92 @@ var (
 		"The amount of memory in percent, that used by domain.",
 		[]string{"domain"},
 		nil)
+
+	libvirtDomainInfoCPUStealTimeDesc = prometheus.NewDesc(
+		prometheus.BuildFQName("libvirt", "domain_info", "cpu_steal_time_total"),
+		"Amount of CPU time stolen from the domain, in ns, that is, 1/1,000,000,000 of a second, or 10−9 seconds.",
+		[]string{"domain", "cpu"},
+		nil)
 )
+
+// QueryCPUsResult holds the structured representative of QMP's "query-cpus" output
+type QueryCPUsResult struct {
+	Return []QemuThread `json:"return"`
+}
+
+// QemuThread holds qemu thread info: which virtual cpu is it, what the thread PID is
+type QemuThread struct {
+	CPU      int
+	ThreadID int `json:"thread_id"`
+}
+
+// ReadStealTime reads the file /proc/<thread_id>/schedstat and returns
+// the second field as a float64 value
+func ReadStealTime(pid int) (float64, error) {
+	var retval float64
+	path := fmt.Sprintf("/proc/%d/schedstat", pid)
+	result, err := ioutil.ReadFile(path)
+	if err != nil {
+		return 0, err
+	}
+
+	values := strings.Split(string(result), " ")
+	// We expect exactly 3 fields in the output, otherwise we return error
+	if len(values) != 3 {
+		return 0, fmt.Errorf("Unexpected amount of fields in %s. The file content is \"%s\"", path, result)
+	}
+
+	retval, err = strconv.ParseFloat(values[1], 64)
+	if err != nil {
+		return 0, err
+	}
+
+	return retval, nil
+}
+
+// CollectDomainStealTime contacts the running QEMU instance via QemuMonitorCommand API call,
+// gets the PIDs of the running CPU threads.
+// It then calls ReadStealTime for every thread to obtain its steal times
+func CollectDomainStealTime(ch chan<- prometheus.Metric, domain *libvirt.Domain) error {
+	var totalStealTime float64
+	var domainName string
+
+	// Get the domain name
+	domainName, err := domain.GetName()
+	if err != nil {
+		return err
+	}
+
+	// query QEMU directly to ask PID numbers of its CPU threads
+	resultJSON, err := domain.QemuMonitorCommand("{\"execute\": \"query-cpus\"}", libvirt.DOMAIN_QEMU_MONITOR_COMMAND_DEFAULT)
+	if err != nil {
+		return err
+	}
+	// Allocate a map for the json parser results
+	qemuThreadsResult := QueryCPUsResult{Return: make([]QemuThread, 0, 8)}
+
+	// Parse the result into the map
+	err = json.Unmarshal([]byte(resultJSON), &qemuThreadsResult)
+	if err != nil {
+		return err
+	}
+
+	// Now iterate over qemuThreadsResult to get the list of QemuThread
+	for _, thread := range qemuThreadsResult.Return {
+		stealTime, err := ReadStealTime(thread.ThreadID)
+		if err != nil {
+			log.Printf("Error fetching steal time for the thread %d: %v. Skipping", thread.ThreadID, err)
+			continue
+		}
+		// Increment the total steal time
+		totalStealTime += stealTime
+
+		// Send the metric for this CPU
+		ch <- prometheus.MustNewConstMetric(libvirtDomainInfoCPUStealTimeDesc, prometheus.CounterValue, stealTime, domainName, fmt.Sprintf("%d", thread.CPU))
+	}
+	ch <- prometheus.MustNewConstMetric(libvirtDomainInfoCPUStealTimeDesc, prometheus.CounterValue, totalStealTime, domainName, "total")
+	return nil
+}
 
 // CollectDomain extracts Prometheus metrics from a libvirt domain.
 func CollectDomain(ch chan<- prometheus.Metric, stat libvirt.DomainStats) error {
@@ -484,8 +575,8 @@ func CollectDomain(ch chan<- prometheus.Metric, stat libvirt.DomainStats) error 
 	var used_percent float64
 	if err == nil {
 		MemoryStats = MemoryStatCollect(&memorystat)
-		if (MemoryStats.Usable != 0 && MemoryStats.Available != 0) {
-			used_percent = (float64(MemoryStats.Available) - float64(MemoryStats.Usable)) / (float64(MemoryStats.Available)/float64(100))
+		if MemoryStats.Usable != 0 && MemoryStats.Available != 0 {
+			used_percent = (float64(MemoryStats.Available) - float64(MemoryStats.Usable)) / (float64(MemoryStats.Available) / float64(100))
 		}
 
 	}
@@ -535,32 +626,6 @@ func CollectDomain(ch chan<- prometheus.Metric, stat libvirt.DomainStats) error 
 		float64(used_percent),
 		domainName)
 
-
-	return nil
-}
-
-// CollectFromLibvirt obtains Prometheus metrics from all domains in a
-// libvirt setup.
-func CollectFromLibvirt(ch chan<- prometheus.Metric, uri string) error {
-	conn, err := libvirt.NewConnectReadOnly(uri)
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-
-	stats, err := conn.GetAllDomainStats([]*libvirt.Domain{}, libvirt.DOMAIN_STATS_STATE|libvirt.DOMAIN_STATS_CPU_TOTAL|
-		libvirt.DOMAIN_STATS_INTERFACE|libvirt.DOMAIN_STATS_BALLOON|libvirt.DOMAIN_STATS_BLOCK|
-		libvirt.DOMAIN_STATS_PERF|libvirt.DOMAIN_STATS_VCPU, 0)
-	if err != nil {
-		return err
-	}
-	for _, stat := range stats {
-		err = CollectDomain(ch, stat)
-		stat.Domain.Free()
-		if err != nil {
-			return err
-		}
-	}
 	return nil
 }
 
@@ -591,13 +656,18 @@ func MemoryStatCollect(memorystat *[]libvirt.DomainMemoryStat) libvirt_schema.Vi
 
 // LibvirtExporter implements a Prometheus exporter for libvirt state.
 type LibvirtExporter struct {
-	uri string
+	uri      string
+	login    string
+	password string
+	conn     *libvirt.Connect
 }
 
 // NewLibvirtExporter creates a new Prometheus exporter for libvirt.
-func NewLibvirtExporter(uri string) (*LibvirtExporter, error) {
+func NewLibvirtExporter(uri string, login string, password string) (*LibvirtExporter, error) {
 	return &LibvirtExporter{
-		uri: uri,
+		uri:      uri,
+		login:    login,
+		password: password,
 	}, nil
 }
 
@@ -611,6 +681,7 @@ func (e *LibvirtExporter) Describe(ch chan<- *prometheus.Desc) {
 	ch <- libvirtDomainInfoMemoryUsageDesc
 	ch <- libvirtDomainInfoNrVirtCpuDesc
 	ch <- libvirtDomainInfoCpuTimeDesc
+	ch <- libvirtDomainInfoCPUStealTimeDesc
 	ch <- libvirtDomainInfoVirDomainState
 
 	// Domain block stats
@@ -649,7 +720,7 @@ func (e *LibvirtExporter) Describe(ch chan<- *prometheus.Desc) {
 
 // Collect scrapes Prometheus metrics from libvirt.
 func (e *LibvirtExporter) Collect(ch chan<- prometheus.Metric) {
-	err := CollectFromLibvirt(ch, e.uri)
+	err := e.CollectFromLibvirt(ch)
 	if err == nil {
 		ch <- prometheus.MustNewConstMetric(
 			libvirtUpDesc,
@@ -664,16 +735,107 @@ func (e *LibvirtExporter) Collect(ch chan<- prometheus.Metric) {
 	}
 }
 
+func (e *LibvirtExporter) connectLibvirtWithAuth(uri string) (*libvirt.Connect, error) {
+	if e.login == "" || e.password == "" {
+		return nil, fmt.Errorf("Empty username or password was provided. Not attempting to authenticate using SASL")
+	}
+
+	callback := func(creds []*libvirt.ConnectCredential) {
+		for _, cred := range creds {
+			switch cred.Type {
+			case libvirt.CRED_AUTHNAME:
+				cred.Result = e.login
+				cred.ResultLen = len(cred.Result)
+
+			case libvirt.CRED_PASSPHRASE:
+				cred.Result = e.password
+				cred.ResultLen = len(cred.Result)
+
+			}
+		}
+	}
+
+	auth := &libvirt.ConnectAuth{
+		CredType: []libvirt.ConnectCredentialType{
+			libvirt.CRED_AUTHNAME, libvirt.CRED_PASSPHRASE,
+		},
+		Callback: callback,
+	}
+
+	return libvirt.NewConnectWithAuth(uri, auth, 0) // connect flag 0 means "read-write"
+}
+
+func (e *LibvirtExporter) Connect() (isReadonly bool, err error) {
+	// First, try to connect without authentication, and with the full access
+	if e.conn, err = libvirt.NewConnect(e.uri); err == nil {
+		return
+	}
+
+	// Then, if the connection has failed, we try accessing libvirt with the authentication
+	if e.conn, err = e.connectLibvirtWithAuth(e.uri); err == nil {
+		return
+	}
+
+	// Then, if the authenticated connection failed we attempt to connect using readonly
+	if e.conn, err = libvirt.NewConnectReadOnly(e.uri); err == nil {
+		isReadonly = true
+		return
+	}
+
+	return
+}
+
+func (e *LibvirtExporter) Close() {
+	e.conn.Close()
+}
+
+// CollectFromLibvirt obtains Prometheus metrics from all domains in a
+// libvirt setup.
+func (e *LibvirtExporter) CollectFromLibvirt(ch chan<- prometheus.Metric) error {
+	readOnly, err := e.Connect()
+	if err != nil {
+		return err
+	}
+	defer e.Close()
+
+	stats, err := e.conn.GetAllDomainStats([]*libvirt.Domain{}, libvirt.DOMAIN_STATS_STATE|libvirt.DOMAIN_STATS_CPU_TOTAL|
+		libvirt.DOMAIN_STATS_INTERFACE|libvirt.DOMAIN_STATS_BALLOON|libvirt.DOMAIN_STATS_BLOCK|
+		libvirt.DOMAIN_STATS_PERF|libvirt.DOMAIN_STATS_VCPU, 0)
+	if err != nil {
+		return err
+	}
+	for _, stat := range stats {
+		err = CollectDomain(ch, stat)
+		if err != nil {
+			log.Println(err)
+			stat.Domain.Free()
+			continue
+		}
+		if !readOnly {
+			err = CollectDomainStealTime(ch, stat.Domain)
+			if err != nil {
+				log.Println(err)
+				stat.Domain.Free()
+				continue
+			}
+		}
+		stat.Domain.Free()
+	}
+	return nil
+}
+
 func main() {
 	var (
-		app           = kingpin.New("libvirt_exporter", "Prometheus metrics exporter for libvirt")
-		listenAddress = app.Flag("web.listen-address", "Address to listen on for web interface and telemetry.").Default(":9177").String()
-		metricsPath   = app.Flag("web.telemetry-path", "Path under which to expose metrics.").Default("/metrics").String()
-		libvirtURI    = app.Flag("libvirt.uri", "Libvirt URI from which to extract metrics.").Default("qemu:///system").String()
+		app             = kingpin.New("libvirt_exporter", "Prometheus metrics exporter for libvirt")
+		listenAddress   = app.Flag("web.listen-address", "Address to listen on for web interface and telemetry.").Default(":9177").String()
+		metricsPath     = app.Flag("web.telemetry-path", "Path under which to expose metrics.").Default("/metrics").String()
+		libvirtURI      = app.Flag("libvirt.uri", "Libvirt URI from which to extract metrics.").Default("qemu:///system").String()
+		libvirtUsername = app.Flag("libvirt.auth.username", "User name for SASL login (you can also use LIBVIRT_EXPORTER_USERNAME environment variable)").Default("").Envar("LIBVIRT_EXPORTER_USERNAME").String()
+		libvirtPassword = app.Flag("libvirt.auth.password", "Password for SASL login (you can also use LIBVIRT_EXPORTER_PASSWORD environment variable)").Default("").Envar("LIBVIRT_EXPORTER_PASSWORD").String()
 	)
 	kingpin.MustParse(app.Parse(os.Args[1:]))
 
-	exporter, err := NewLibvirtExporter(*libvirtURI)
+	exporter, err := NewLibvirtExporter(*libvirtURI, *libvirtUsername, *libvirtPassword)
 	if err != nil {
 		panic(err)
 	}
