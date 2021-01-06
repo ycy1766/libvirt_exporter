@@ -43,31 +43,30 @@ var (
 	libvirtDomainInfoMaxMemDesc = prometheus.NewDesc(
 		prometheus.BuildFQName("libvirt", "domain_info", "maximum_memory_bytes"),
 		"Maximum allowed memory of the domain, in bytes.",
-		[]string{"domain"},
+		[]string{"domain", "uuid", "name", "flavor", "project_name"},
 		nil)
 	libvirtDomainInfoMemoryUsageDesc = prometheus.NewDesc(
 		prometheus.BuildFQName("libvirt", "domain_info", "memory_usage_bytes"),
 		"Memory usage of the domain, in bytes.",
-		[]string{"domain"},
+		[]string{"domain", "uuid", "name", "flavor", "project_name"},
 		nil)
 	libvirtDomainInfoNrVirtCpuDesc = prometheus.NewDesc(
 		prometheus.BuildFQName("libvirt", "domain_info", "virtual_cpus"),
 		"Number of virtual CPUs for the domain.",
-		[]string{"domain"},
+		[]string{"domain", "uuid", "name", "flavor", "project_name"},
 		nil)
 	libvirtDomainInfoCpuTimeDesc = prometheus.NewDesc(
 		prometheus.BuildFQName("libvirt", "domain_info", "cpu_time_seconds_total"),
 		"Amount of CPU time used by the domain, in seconds.",
-		[]string{"domain"},
+		[]string{"domain", "uuid", "name", "flavor", "project_name"},
 		nil)
 	libvirtDomainInfoVirDomainState = prometheus.NewDesc(
 		prometheus.BuildFQName("libvirt", "domain_info", "vstate"),
 		"Virtual domain state. 0: no state, 1: the domain is running, 2: the domain is blocked on resource,"+
 			" 3: the domain is paused by user, 4: the domain is being shut down, 5: the domain is shut off,"+
 			"6: the domain is crashed, 7: the domain is suspended by guest power management",
-		[]string{"domain"},
+		[]string{"domain", "uuid", "name", "flavor", "project_name"},
 		nil)
-
 	libvirtDomainBlockRdBytesDesc = prometheus.NewDesc(
 		prometheus.BuildFQName("libvirt", "domain_block_stats", "read_bytes_total"),
 		"Number of bytes read from a block device, in bytes.",
@@ -305,7 +304,7 @@ func CollectDomainStealTime(ch chan<- prometheus.Metric, domain *libvirt.Domain)
 }
 
 // CollectDomain extracts Prometheus metrics from a libvirt domain.
-func CollectDomain(ch chan<- prometheus.Metric, stat libvirt.DomainStats) error {
+func (e *LibvirtExporter) CollectDomain(ch chan<- prometheus.Metric, stat libvirt.DomainStats) error {
 	domainName, err := stat.Domain.GetName()
 	if err != nil {
 		return err
@@ -321,37 +320,53 @@ func CollectDomain(ch chan<- prometheus.Metric, stat libvirt.DomainStats) error 
 	if err != nil {
 		return err
 	}
+	var domainUUID = desc.UUID
+	
+	// Extract domain label valuies
+	var domainLabelValues []string
+	if e.exportNovaMetadata {
+		var (
+			novaName        = desc.Metadata.NovaInstance.Name
+			novaFlavor      = desc.Metadata.NovaInstance.Flavor.Name
+			novaProjectName = desc.Metadata.NovaInstance.Owner.ProjectName
+		)
+		domainLabelValues = []string{domainName, domainUUID, novaName, novaFlavor, novaProjectName}
+	} else {
+		domainLabelValues = []string{domainName, domainUUID}
+	}
 
+	
 	// Report domain info.
 	info, err := stat.Domain.GetInfo()
 	if err != nil {
 		return err
 	}
+
 	ch <- prometheus.MustNewConstMetric(
 		libvirtDomainInfoMaxMemDesc,
 		prometheus.GaugeValue,
 		float64(info.MaxMem)*1024,
-		domainName)
+		domainLabelValues...)
 	ch <- prometheus.MustNewConstMetric(
 		libvirtDomainInfoMemoryUsageDesc,
 		prometheus.GaugeValue,
 		float64(info.Memory)*1024,
-		domainName)
+		domainLabelValues...)
 	ch <- prometheus.MustNewConstMetric(
 		libvirtDomainInfoNrVirtCpuDesc,
 		prometheus.GaugeValue,
 		float64(info.NrVirtCpu),
-		domainName)
+		domainLabelValues...)
 	ch <- prometheus.MustNewConstMetric(
 		libvirtDomainInfoCpuTimeDesc,
 		prometheus.CounterValue,
 		float64(info.CpuTime)/1e9,
-		domainName)
+		domainLabelValues...)
 	ch <- prometheus.MustNewConstMetric(
 		libvirtDomainInfoVirDomainState,
 		prometheus.CounterValue,
 		float64(info.State),
-		domainName)
+		domainLabelValues...)
 	// Report block device statistics.
 	for _, disk := range stat.Block {
 		var DiskSource string
@@ -660,14 +675,24 @@ type LibvirtExporter struct {
 	login    string
 	password string
 	conn     *libvirt.Connect
+	exportNovaMetadata bool
 }
 
 // NewLibvirtExporter creates a new Prometheus exporter for libvirt.
-func NewLibvirtExporter(uri string, login string, password string) (*LibvirtExporter, error) {
+func NewLibvirtExporter(uri string, login string, password string,  exportNovaMetadata bool) (*LibvirtExporter, error) {
+	// var domainLabels []string
+	// if exportNovaMetadata {
+	// 	domainLabels = []string{"domain", "uuid", "name", "flavor", "project_name"}
+	// } else {
+	// 	domainLabels = []string{"domain", "uuid"}
+	// }
+
+	
 	return &LibvirtExporter{
 		uri:      uri,
 		login:    login,
 		password: password,
+		exportNovaMetadata: exportNovaMetadata,
 	}, nil
 }
 
@@ -805,7 +830,7 @@ func (e *LibvirtExporter) CollectFromLibvirt(ch chan<- prometheus.Metric) error 
 		return err
 	}
 	for _, stat := range stats {
-		err = CollectDomain(ch, stat)
+		err = e.CollectDomain(ch, stat)
 		if err != nil {
 			log.Println(err)
 			stat.Domain.Free()
@@ -832,10 +857,11 @@ func main() {
 		libvirtURI      = app.Flag("libvirt.uri", "Libvirt URI from which to extract metrics.").Default("qemu:///system").String()
 		libvirtUsername = app.Flag("libvirt.auth.username", "User name for SASL login (you can also use LIBVIRT_EXPORTER_USERNAME environment variable)").Default("").Envar("LIBVIRT_EXPORTER_USERNAME").String()
 		libvirtPassword = app.Flag("libvirt.auth.password", "Password for SASL login (you can also use LIBVIRT_EXPORTER_PASSWORD environment variable)").Default("").Envar("LIBVIRT_EXPORTER_PASSWORD").String()
+		libvirtExportNovaMetadata = app.Flag("libvirt.export-nova-metadata", "Export OpenStack Nova specific labels from libvirt domain xml").Default("true").Bool()
 	)
 	kingpin.MustParse(app.Parse(os.Args[1:]))
 
-	exporter, err := NewLibvirtExporter(*libvirtURI, *libvirtUsername, *libvirtPassword)
+	exporter, err := NewLibvirtExporter(*libvirtURI, *libvirtUsername, *libvirtPassword, *libvirtExportNovaMetadata)
 	if err != nil {
 		panic(err)
 	}

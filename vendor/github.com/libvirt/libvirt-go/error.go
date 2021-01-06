@@ -353,6 +353,33 @@ const (
 
 	// error in libssh transport driver
 	ERR_LIBSSH = ErrorNumber(C.VIR_ERR_LIBSSH)
+
+	// libvirt fail to find the desired device
+	ERR_DEVICE_MISSING = ErrorNumber(C.VIR_ERR_DEVICE_MISSING)
+
+	// Invalid nwfilter binding object
+	ERR_INVALID_NWFILTER_BINDING = ErrorNumber(C.VIR_ERR_INVALID_NWFILTER_BINDING)
+
+	// Requested nwfilter binding does not exist
+	ERR_NO_NWFILTER_BINDING = ErrorNumber(C.VIR_ERR_NO_NWFILTER_BINDING)
+
+	// invalid domain checkpoint
+	ERR_INVALID_DOMAIN_CHECKPOINT = ErrorNumber(C.VIR_ERR_INVALID_DOMAIN_CHECKPOINT)
+
+	// domain checkpoint not found
+	ERR_NO_DOMAIN_CHECKPOINT = ErrorNumber(C.VIR_ERR_NO_DOMAIN_CHECKPOINT)
+
+	// domain backup job id not found *
+	ERR_NO_DOMAIN_BACKUP = ErrorNumber(C.VIR_ERR_NO_DOMAIN_BACKUP)
+
+	// invalid network port object
+	ERR_INVALID_NETWORK_PORT = ErrorNumber(C.VIR_ERR_INVALID_NETWORK_PORT)
+
+	// network port already exists
+	ERR_NETWORK_PORT_EXIST = ErrorNumber(C.VIR_ERR_NETWORK_PORT_EXIST)
+
+	// network port not found
+	ERR_NO_NETWORK_PORT = ErrorNumber(C.VIR_ERR_NO_NETWORK_PORT)
 )
 
 type ErrorDomain int
@@ -560,6 +587,12 @@ const (
 
 	// Error from resoruce control
 	FROM_RESCTRL = ErrorDomain(C.VIR_FROM_RESCTRL)
+
+	// Error from firewalld
+	FROM_FIREWALLD = ErrorDomain(C.VIR_FROM_FIREWALLD)
+
+	// Error from domain checkpoint
+	FROM_DOMAIN_CHECKPOINT = ErrorDomain(C.VIR_FROM_DOMAIN_CHECKPOINT)
 )
 
 type Error struct {
@@ -574,27 +607,18 @@ func (err Error) Error() string {
 		err.Code, err.Domain, err.Message)
 }
 
-func GetLastError() Error {
-	err := C.virGetLastError()
-	if err == nil {
-		return Error{
-			Code:    ERR_OK,
-			Domain:  FROM_NONE,
-			Message: "Missing error",
-			Level:   ERR_NONE,
-		}
-	}
-	virErr := Error{
+func makeError(err *C.virError) Error {
+	ret := Error{
 		Code:    ErrorNumber(err.code),
 		Domain:  ErrorDomain(err.domain),
 		Message: C.GoString(err.message),
 		Level:   ErrorLevel(err.level),
 	}
 	C.virResetError(err)
-	return virErr
+	return ret
 }
 
-func GetNotImplementedError(apiname string) Error {
+func makeNotImplementedError(apiname string) Error {
 	return Error{
 		Code:    ERR_NO_SUPPORT,
 		Domain:  FROM_NONE,
