@@ -825,7 +825,8 @@ func (e *LibvirtExporter) CollectFromLibvirt(ch chan<- prometheus.Metric) error 
 
 	stats, err := e.conn.GetAllDomainStats([]*libvirt.Domain{}, libvirt.DOMAIN_STATS_STATE|libvirt.DOMAIN_STATS_CPU_TOTAL|
 		libvirt.DOMAIN_STATS_INTERFACE|libvirt.DOMAIN_STATS_BALLOON|libvirt.DOMAIN_STATS_BLOCK|
-		libvirt.DOMAIN_STATS_PERF|libvirt.DOMAIN_STATS_VCPU, 0)
+		libvirt.DOMAIN_STATS_PERF|libvirt.DOMAIN_STATS_VCPU, 	
+		libvirt.CONNECT_GET_ALL_DOMAINS_STATS_RUNNING)
 	if err != nil {
 		return err
 	}
